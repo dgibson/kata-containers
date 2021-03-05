@@ -18,6 +18,7 @@ use crate::mount::{DRIVER_BLK_TYPE, DRIVER_MMIO_BLK_TYPE, DRIVER_NVDIMM_TYPE, DR
 use crate::pci;
 use crate::sandbox::Sandbox;
 use crate::AGENT_CONFIG;
+use crate::uevent::Uevent;
 use anyhow::{anyhow, Result};
 use oci::{LinuxDeviceCgroup, LinuxResources, Spec};
 use protocols::agent::Device;
@@ -101,14 +102,14 @@ async fn get_device_name(sandbox: &Arc<Mutex<Sandbox>>, dev_addr: &str) -> Resul
     // The key of the watchers map is the device we are interested in.
     // Note this is done inside the lock, not to miss any events from the
     // global udev listener.
-    let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+    let (tx, rx) = tokio::sync::oneshot::channel::<Uevent>();
     sb.dev_watcher.insert(dev_addr.to_string(), tx);
     drop(sb); // unlock
 
     info!(sl!(), "Waiting on channel for device notification\n");
     let hotplug_timeout = AGENT_CONFIG.read().await.hotplug_timeout;
 
-    let dev_name = match tokio::time::timeout(hotplug_timeout, rx).await {
+    let uev = match tokio::time::timeout(hotplug_timeout, rx).await {
         Ok(v) => v?,
         Err(_) => {
             let mut sb = sandbox.lock().await;
@@ -122,7 +123,7 @@ async fn get_device_name(sandbox: &Arc<Mutex<Sandbox>>, dev_addr: &str) -> Resul
         }
     };
 
-    Ok(format!("{}/{}", SYSTEM_DEV_PATH, &dev_name))
+    Ok(format!("{}/{}", SYSTEM_DEV_PATH, &uev.devname))
 }
 
 pub async fn get_scsi_device_name(
@@ -795,7 +796,7 @@ mod tests {
         assert_eq!(name.unwrap(), format!("{}/{}", SYSTEM_DEV_PATH, devname));
 
         let mut sb = sandbox.lock().await;
-        sb.uevent_map.remove(&devpath);
+        let uev = sb.uevent_map.remove(&devpath).unwrap();
         drop(sb); // unlock
 
         let watcher_sandbox = Arc::clone(&sandbox);
@@ -811,7 +812,7 @@ mod tests {
 
                 if let Some(k) = matched_key {
                     let sender = sb.dev_watcher.remove(&k).unwrap();
-                    let _ = sender.send(devname.to_string());
+                    let _ = sender.send(uev);
                     return;
                 }
                 drop(sb); // unlock
