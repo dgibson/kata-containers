@@ -3,11 +3,13 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use crate::AGENT_CONFIG;
 use crate::device::online_device;
 use crate::linux_abi::*;
 use crate::sandbox::Sandbox;
 use slog::Logger;
 
+use anyhow::{anyhow, Result};
 use netlink_sys::{protocols, SocketAddr, TokioSocket};
 use nix::errno::Errno;
 use std::fmt::Debug;
@@ -15,7 +17,14 @@ use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-#[derive(Debug, Default, Clone)]
+// Convenience macro to obtain the scope logger
+macro_rules! sl {
+    () => {
+        slog_scope::logger().new(o!("subsystem" => "uevent"))
+    };
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Uevent {
     pub action: String,
     pub devpath: String,
@@ -94,6 +103,42 @@ impl Uevent {
     }
 }
 
+pub async fn wait_for_uevent(sandbox: &Arc<Mutex<Sandbox>>, matcher: impl UeventMatcher) -> Result<Uevent> {
+    let mut sb = sandbox.lock().await;
+    for uev in sb.uevent_map.values() {
+        if matcher.is_match(uev) {
+            info!(sl!(), "Device {:?} found in pci device map", uev);
+            return Ok(uev.clone());
+        }
+    }
+
+    // If device is not found in the device map, hotplug event has not
+    // been received yet, create and add channel to the watchers map.
+    // The key of the watchers map is the device we are interested in.
+    // Note this is done inside the lock, not to miss any events from the
+    // global udev listener.
+    let (tx, rx) = tokio::sync::oneshot::channel::<Uevent>();
+    let idx = sb.uevent_watchers.len();
+    sb.uevent_watchers.push(Some((Box::new(matcher), tx)));
+    drop(sb); // unlock
+
+    info!(sl!(), "Waiting on channel for uevent notification\n");
+    let hotplug_timeout = AGENT_CONFIG.read().await.hotplug_timeout;
+
+    let uev = match tokio::time::timeout(hotplug_timeout, rx).await {
+        Ok(v) => v?,
+        Err(_) => {
+            let mut sb = sandbox.lock().await;
+            sb.uevent_watchers[idx].take();
+
+            return Err(anyhow!("Timeout after {:?} waiting for uevent",
+                               hotplug_timeout));
+        }
+    };
+
+    Ok(uev)
+}
+
 pub async fn watch_uevents(sandbox: Arc<Mutex<Sandbox>>) {
     let sref = sandbox.clone();
     let s = sref.lock().await;
@@ -139,4 +184,46 @@ pub async fn watch_uevents(sandbox: Arc<Mutex<Sandbox>>) {
             }
         }
     });
+}
+
+// Used from the device module to test specific matchers
+#[cfg(test)]
+pub(crate) async fn test_wait_for_uevent_helper(uev: Uevent, matcher: impl UeventMatcher+Clone) {
+    let devpath = uev.devpath.clone();
+    let logger = slog::Logger::root(slog::Discard, o!());
+    let sandbox = Arc::new(Mutex::new(Sandbox::new(&logger).unwrap()));
+
+    let mut sb = sandbox.lock().await;
+    sb.uevent_map.insert(devpath.clone(), uev.clone());
+    drop(sb); // unlock
+
+    let uev1 = wait_for_uevent(&sandbox, matcher.clone()).await;
+    assert!(uev1.is_ok(), "{}", uev1.unwrap_err());
+    assert_eq!(uev1.unwrap(), uev);
+
+    let mut sb = sandbox.lock().await;
+    sb.uevent_map.remove(&devpath).unwrap();
+    drop(sb); // unlock
+
+    let watcher_sandbox = Arc::clone(&sandbox);
+    let watcher_uev = uev.clone();
+    tokio::spawn(async move {
+        loop {
+            let mut sb = watcher_sandbox.lock().await;
+            for w in &mut sb.uevent_watchers {
+                if let Some((matcher, _)) = w {
+                    if matcher.is_match(&watcher_uev) {
+                        let (_, sender) = w.take().unwrap();
+                        let _ = sender.send(watcher_uev);
+                        return;
+                    }
+                }
+            }
+            drop(sb); // unlock
+        }
+    });
+
+    let uev2 = wait_for_uevent(&sandbox, matcher).await;
+    assert!(uev2.is_ok(), "{}", uev2.unwrap_err());
+    assert_eq!(uev2.unwrap(), uev);
 }

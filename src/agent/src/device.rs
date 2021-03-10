@@ -17,8 +17,7 @@ use crate::linux_abi::*;
 use crate::mount::{DRIVER_BLK_TYPE, DRIVER_MMIO_BLK_TYPE, DRIVER_NVDIMM_TYPE, DRIVER_SCSI_TYPE};
 use crate::pci;
 use crate::sandbox::Sandbox;
-use crate::AGENT_CONFIG;
-use crate::uevent::{Uevent, UeventMatcher};
+use crate::uevent::{Uevent, UeventMatcher, wait_for_uevent};
 use anyhow::{anyhow, Result};
 use oci::{LinuxDeviceCgroup, LinuxResources, Spec};
 use protocols::agent::Device;
@@ -88,7 +87,7 @@ fn pcipath_to_sysfs(root_bus_sysfs: &str, pcipath: &pci::Path) -> Result<String>
     Ok(relpath)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DevAddrMatcher {
     dev_addr: String,
 }
@@ -134,40 +133,7 @@ impl UeventMatcher for DevAddrMatcher {
 async fn get_device_name(sandbox: &Arc<Mutex<Sandbox>>, dev_addr: &str) -> Result<String> {
     let matcher = DevAddrMatcher::new(dev_addr);
 
-    let mut sb = sandbox.lock().await;
-    for uev in sb.uevent_map.values() {
-        if matcher.is_match(uev) {
-            info!(sl!(), "Device {} found in pci device map", dev_addr);
-            return Ok(format!("{}/{}", SYSTEM_DEV_PATH, uev.devname));
-        }
-    }
-
-    // If device is not found in the device map, hotplug event has not
-    // been received yet, create and add channel to the watchers map.
-    // The key of the watchers map is the device we are interested in.
-    // Note this is done inside the lock, not to miss any events from the
-    // global udev listener.
-    let (tx, rx) = tokio::sync::oneshot::channel::<Uevent>();
-    let idx = sb.uevent_watchers.len();
-    sb.uevent_watchers.push(Some((Box::new(matcher), tx)));
-    drop(sb); // unlock
-
-    info!(sl!(), "Waiting on channel for device notification\n");
-    let hotplug_timeout = AGENT_CONFIG.read().await.hotplug_timeout;
-
-    let uev = match tokio::time::timeout(hotplug_timeout, rx).await {
-        Ok(v) => v?,
-        Err(_) => {
-            let mut sb = sandbox.lock().await;
-            sb.uevent_watchers[idx].take();
-
-            return Err(anyhow!(
-                "Timeout reached after {:?} waiting for device {}",
-                hotplug_timeout,
-                dev_addr
-            ));
-        }
-    };
+    let uev = wait_for_uevent(sandbox, matcher).await?;
 
     Ok(format!("{}/{}", SYSTEM_DEV_PATH, &uev.devname))
 }
@@ -475,6 +441,7 @@ mod tests {
     use super::*;
     use oci::Linux;
     use tempfile::tempdir;
+    use crate::uevent::test_wait_for_uevent_helper;
 
     #[test]
     fn test_update_device_cgroup() {
@@ -821,7 +788,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_device_name() {
+    async fn test_dev_attr_matcher() {
         let pci_root_bus_path = create_pci_root_bus_path();
         let devname = "vda";
         let busid = "0000:00:00.0";
@@ -833,40 +800,8 @@ mod tests {
         uev.devpath = devpath.clone();
         uev.devname = devname.to_string();
 
-        let logger = slog::Logger::root(slog::Discard, o!());
-        let sandbox = Arc::new(Mutex::new(Sandbox::new(&logger).unwrap()));
+        let matcher = DevAddrMatcher::new(busid);
 
-        let mut sb = sandbox.lock().await;
-        sb.uevent_map.insert(devpath.clone(), uev);
-        drop(sb); // unlock
-
-        let name = get_device_name(&sandbox, busid).await;
-        assert!(name.is_ok(), "{}", name.unwrap_err());
-        assert_eq!(name.unwrap(), format!("{}/{}", SYSTEM_DEV_PATH, devname));
-
-        let mut sb = sandbox.lock().await;
-        let uev = sb.uevent_map.remove(&devpath).unwrap();
-        drop(sb); // unlock
-
-        let watcher_sandbox = Arc::clone(&sandbox);
-        tokio::spawn(async move {
-            loop {
-                let mut sb = watcher_sandbox.lock().await;
-                for w in &mut sb.uevent_watchers {
-                    if let Some((matcher, _)) = w {
-                        if matcher.is_match(&uev) {
-                            let (_, sender) = w.take().unwrap();
-                            let _ = sender.send(uev);
-                            return;
-                        }
-                    }
-                }
-                drop(sb); // unlock
-            }
-        });
-
-        let name = get_device_name(&sandbox, busid).await;
-        assert!(name.is_ok(), "{}", name.unwrap_err());
-        assert_eq!(name.unwrap(), format!("{}/{}", SYSTEM_DEV_PATH, devname));
+        test_wait_for_uevent_helper(uev, matcher).await;
     }
 }
